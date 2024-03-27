@@ -1,12 +1,15 @@
 use burn_compute::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
 use hashbrown::HashMap;
-use std::{num::NonZeroU64, sync::Arc};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+};
 
 /// Buffer storage for wgpu.
 pub struct WgpuStorage {
     memory: HashMap<StorageId, Arc<wgpu::Buffer>>,
     deallocations: Vec<StorageId>,
-    device: Arc<wgpu::Device>,
+    device: Arc<Mutex<wgpu::Device>>,
 }
 
 impl core::fmt::Debug for WgpuStorage {
@@ -67,7 +70,7 @@ pub enum WgpuResourceKind {
 /// Keeps actual wgpu buffer references in a hashmap with ids as key.
 impl WgpuStorage {
     /// Create a new storage on the given [device](wgpu::Device).
-    pub fn new(device: Arc<wgpu::Device>) -> Self {
+    pub fn new(device: Arc<Mutex<wgpu::Device>>) -> Self {
         Self {
             memory: HashMap::new(),
             deallocations: Vec::new(),
@@ -104,14 +107,19 @@ impl ComputeStorage for WgpuStorage {
 
     fn alloc(&mut self, size: usize) -> StorageHandle {
         let id = StorageId::new();
-        let buffer = Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: size as u64,
-            usage: wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        }));
+        let buffer = Arc::new(
+            self.device
+                .lock()
+                .unwrap()
+                .create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: size as u64,
+                    usage: wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+        );
 
         self.memory.insert(id.clone(), buffer);
 

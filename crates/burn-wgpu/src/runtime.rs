@@ -13,7 +13,7 @@ use burn_compute::{
     ComputeRuntime,
 };
 use burn_jit::Runtime;
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Mutex};
 use wgpu::{AdapterInfo, DeviceDescriptor};
 
 /// Runtime that uses the [wgpu] crate with the wgsl compiler.
@@ -82,7 +82,7 @@ async fn create_client<G: GraphicsApi>(
         Err(_) => 64, // 64 tasks by default
     };
 
-    let device = Arc::new(device_wgpu);
+    let device = Arc::new(Mutex::new(device_wgpu));
     let storage = WgpuStorage::new(device.clone());
     let memory_management = SimpleMemoryManagement::new(
         storage,

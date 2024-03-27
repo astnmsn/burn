@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use super::WgpuStorage;
 use alloc::{borrow::Cow, sync::Arc};
 use burn_compute::{
@@ -16,9 +18,9 @@ use wgpu::{
 #[derive(Debug)]
 pub struct WgpuServer<MM: MemoryManagement<WgpuStorage>> {
     memory_management: MM,
-    device: Arc<wgpu::Device>,
-    queue: wgpu::Queue,
-    encoder: CommandEncoder,
+    device: Arc<Mutex<wgpu::Device>>,
+    queue: Mutex<wgpu::Queue>,
+    encoder: Mutex<CommandEncoder>,
     kernels: HashMap<String, Arc<CachedKernel>>,
     tasks: Vec<ComputeTask>,
     max_tasks: usize,
@@ -46,19 +48,23 @@ where
     /// Create a new server.
     pub fn new(
         memory_management: MM,
-        device: Arc<wgpu::Device>,
+        device: Arc<Mutex<wgpu::Device>>,
         queue: wgpu::Queue,
         max_tasks: usize,
     ) -> Self {
-        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Command Encoder"),
-        });
+        let encoder =
+            device
+                .lock()
+                .unwrap()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Command Encoder"),
+                });
 
         Self {
             memory_management,
             device,
-            queue,
-            encoder,
+            queue: Mutex::new(queue),
+            encoder: Mutex::new(encoder),
             kernels: HashMap::new(),
             tasks: Vec::new(),
             max_tasks,
@@ -74,10 +80,16 @@ where
         );
         let mut new_encoder = self
             .device
+            .lock()
+            .unwrap()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        core::mem::swap(&mut new_encoder, &mut self.encoder);
 
-        self.queue.submit(Some(new_encoder.finish()));
+        core::mem::swap(&mut new_encoder, &mut self.encoder.lock().unwrap());
+
+        self.queue
+            .lock()
+            .unwrap()
+            .submit(Some(new_encoder.finish()));
 
         // Cleanup allocations and deallocations.
         self.free_manual_allocations();
@@ -126,13 +138,11 @@ where
         if self.tasks.is_empty() {
             return;
         }
-
-        let mut compute = self
-            .encoder
-            .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+        let mut encoder = self.encoder.lock().unwrap();
+        let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
 
         for task in self.tasks.iter() {
             compute.set_pipeline(&task.pipeline.pipeline);
@@ -158,19 +168,18 @@ where
     }
 
     fn compile_source(&self, source: &str) -> Arc<CachedKernel> {
-        let module = self.device.create_shader_module(ShaderModuleDescriptor {
+        let device = self.device.lock().unwrap();
+        let module = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
         });
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: None,
-                layout: None,
-                module: &module,
-                entry_point: "main",
-            });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: "main",
+        });
 
         let bind_group = pipeline.get_bind_group_layout(0);
 
@@ -184,14 +193,18 @@ where
         let resource = self.memory_management.get(&handle.memory);
 
         let size = resource.size();
-        let buffer_dest = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let buffer_dest = self
+            .device
+            .lock()
+            .unwrap()
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
 
-        self.encoder.copy_buffer_to_buffer(
+        self.encoder.lock().unwrap().copy_buffer_to_buffer(
             &resource.buffer,
             resource.offset(),
             &buffer_dest,
@@ -212,7 +225,7 @@ struct BufferReader {
 
 impl BufferReader {
     #[cfg(target_family = "wasm")]
-    async fn read(self, device: alloc::sync::Arc<wgpu::Device>) -> Vec<u8> {
+    async fn read(self, device: alloc::sync::Arc<Mutex<wgpu::Device>>) -> Vec<u8> {
         self.read_async(&device).await
     }
 
@@ -259,12 +272,17 @@ where
     fn read(&mut self, handle: &server::Handle<Self>) -> Reader<Vec<u8>> {
         #[cfg(target_family = "wasm")]
         {
-            let future = self.buffer_reader(handle).read(self.device.clone());
+            let future = self
+                .buffer_reader(handle)
+                .read(self.device.clone().lock().unwrap());
             return Reader::Future(Box::pin(future));
         }
 
         #[cfg(not(target_family = "wasm"))]
-        Reader::Concrete(self.buffer_reader(handle).read(&self.device))
+        Reader::Concrete(
+            self.buffer_reader(handle)
+                .read(&self.device.lock().unwrap()),
+        )
     }
 
     /// When we create a new handle from existing data, we use custom allocations so that we don't
@@ -275,15 +293,17 @@ where
     fn create(&mut self, data: &[u8]) -> server::Handle<Self> {
         let handle = self.manual_reserve(data.len());
 
-        let buffer_src = Arc::new(self.device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("Buffer Src"),
-            contents: data,
-            usage: wgpu::BufferUsages::COPY_SRC,
-        }));
+        let buffer_src = Arc::new(self.device.lock().unwrap().create_buffer_init(
+            &BufferInitDescriptor {
+                label: Some("Buffer Src"),
+                contents: data,
+                usage: wgpu::BufferUsages::COPY_SRC,
+            },
+        ));
 
         let resource = self.memory_management.get(&handle.memory);
 
-        self.encoder.copy_buffer_to_buffer(
+        self.encoder.lock().unwrap().copy_buffer_to_buffer(
             &buffer_src,
             0,
             &resource.buffer,
@@ -316,11 +336,15 @@ where
             })
             .collect::<Vec<_>>();
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &kernel.layout,
-            entries: &entries,
-        });
+        let bind_group =
+            self.device
+                .lock()
+                .unwrap()
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &kernel.layout,
+                    entries: &entries,
+                });
 
         self.tasks
             .push(ComputeTask::new(kernel, bind_group, work_group));
@@ -337,6 +361,6 @@ where
             self.submit();
         }
 
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.lock().unwrap().poll(wgpu::Maintain::Wait);
     }
 }
